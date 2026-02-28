@@ -1,0 +1,16 @@
+# Core dependencies
+numpy>=1.24.0
+
+# JAX for TPU acceleration (install the TPU variant on Cloud TPU VMs):
+#   pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+# For CPU-only development/testing:
+#   pip install jax[cpu]
+jax>=0.4.0
+jaxlib>=0.4.0
+
+# Network
+grpcio>=1.50.0
+protobuf>=4.21.0
+
+# Testing
+pytest>=7.0.0
