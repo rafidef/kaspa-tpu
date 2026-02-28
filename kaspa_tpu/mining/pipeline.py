@@ -94,11 +94,11 @@ def _difficulty_to_target(difficulty: float) -> int:
     For Kaspa stratum, difficulty 1 = max target.
     target = max_target / difficulty
     
-    max_target for Kaspa = 2^255 - 1 (a common convention)
+    max_target for Kaspa = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
     """
     if difficulty <= 0:
         return (1 << 256) - 1  # max
-    max_target = (1 << 256) - 1
+    max_target = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
     target = int(max_target / difficulty)
     return target
 

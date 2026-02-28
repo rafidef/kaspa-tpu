@@ -239,7 +239,8 @@ class StratumClient:
     
     async def submit_solution(self, job_id: str, nonce: int) -> bool:
         """Submit a mining solution to the pool."""
-        nonce_hex = format(nonce, '016x')
+        import struct
+        nonce_hex = struct.pack('<Q', nonce).hex()
         response = await self._call("mining.submit", [
             self.wallet_address,
             job_id,
