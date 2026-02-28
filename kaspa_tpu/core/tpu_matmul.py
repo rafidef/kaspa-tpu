@@ -19,26 +19,45 @@ JAX is used for TPU compilation. The module gracefully falls back to
 CPU/GPU if no TPU is available.
 """
 
+import os
 import numpy as np
 from typing import Optional, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# JAX / TPU initialization
+#
+# On TPU VMs, JAX needs specific environment setup BEFORE import.
+# We configure single-process mode to avoid the multi-host hang.
+# ---------------------------------------------------------------------------
+
+# Prevent JAX from trying multi-process TPU init (causes hang on single-host)
+os.environ.setdefault("TPU_CHIPS_PER_PROCESS_BOUNDS", "2,2,1")
+os.environ.setdefault("TPU_PROCESS_BOUNDS", "1,1,1")
+os.environ.setdefault("TPU_VISIBLE_DEVICES", "0")
+
 # Import JAX with graceful fallback
+HAS_JAX = False
+jax = None
+jnp = None
+
 try:
-    import jax
-    import jax.numpy as jnp
-    from jax import devices as jax_devices
+    import jax as _jax
+    import jax.numpy as _jnp
+    jax = _jax
+    jnp = _jnp
     HAS_JAX = True
 except ImportError:
-    HAS_JAX = False
     logger.warning("JAX not available — TPU acceleration disabled, using NumPy fallback")
 
 
 def get_tpu_device():
     """
     Detect and return a TPU device if available.
+    
+    Uses lazy initialization — only probes for TPU when first called.
     
     Returns:
         JAX device object, or None if no TPU
@@ -47,14 +66,19 @@ def get_tpu_device():
         return None
     
     try:
-        tpus = jax_devices('tpu')
+        # jax.devices() will initialize the backend on first call
+        all_devices = jax.devices()
+        logger.info(f"JAX devices: {all_devices}")
+        
+        tpus = [d for d in all_devices if d.platform == 'tpu']
         if tpus:
-            logger.info(f"Found {len(tpus)} TPU device(s): {tpus}")
+            logger.info(f"Found {len(tpus)} TPU core(s)")
             return tpus[0]
-    except RuntimeError:
-        pass
+        
+        logger.info(f"No TPU found. Available: {[d.platform for d in all_devices]}")
+    except Exception as e:
+        logger.warning(f"Error detecting TPU: {e}")
     
-    logger.info("No TPU found, will use default JAX backend")
     return None
 
 
