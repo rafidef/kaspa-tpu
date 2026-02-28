@@ -131,14 +131,21 @@ class MiningPipeline:
         stats_interval: float = 5.0,
     ):
         self.batch_size = batch_size
-        self.cpu_threads = cpu_threads
         self.on_solution = on_solution
         self.on_stats = on_stats
         self.stats_interval = stats_interval
         
+        # C Keccak releases the GIL → real thread parallelism
+        # Pure Python GIL → 1 thread is optimal (no contention)
+        if USE_FAST_KECCAK:
+            # Cap at 32 threads to avoid excessive overhead per chunk
+            self.cpu_threads = min(cpu_threads, 32)
+        else:
+            self.cpu_threads = 1
+        
         self._tpu_device = get_tpu_device()
         self._tpu_engine: Optional[TPUMatMul] = None
-        self._executor = ThreadPoolExecutor(max_workers=cpu_threads)
+        self._executor = ThreadPoolExecutor(max_workers=self.cpu_threads)
         self._current_template: Optional[BlockTemplate] = None
         self._current_matrix: Optional[Matrix] = None
         self._target: int = 0
@@ -181,8 +188,7 @@ class MiningPipeline:
         self._running = True
         self._stats = PipelineStats()
         
-        # Determine optimal chunk size based on threads
-        # Each thread gets an equal share of the batch
+        # Determine optimal chunk count and sizes
         n_chunks = max(1, self.cpu_threads)
         chunk_size = max(256, self.batch_size // n_chunks)
         total_batch = chunk_size * n_chunks
