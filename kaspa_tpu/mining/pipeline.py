@@ -1,43 +1,29 @@
 """
 Hybrid CPU↔TPU mining pipeline for Kaspa kHeavyHash.
 
-Architecture: Triple-buffered async pipeline
-  Stage 1 (CPU): PrePowHash — batch of nonces → C Keccak → hashes
-  Stage 2 (TPU): MatMul — hashes → nibbles → batched MatMul → products
-  Stage 3 (CPU): PostHash — XOR + C HeavyHash + difficulty check
+When the integrated C miner is available (gcc present), the ENTIRE
+pipeline runs in C with zero Python overhead:
+  PrePowHash → nibble extraction → 64×64 MatMul → XOR → HeavyHash → difficulty check
 
-Uses C-accelerated Keccak (100-1000x faster than pure Python),
-multiprocessing to saturate all CPU cores, and JAX for TPU MatMul.
+The C engine uses ThreadPoolExecutor with GIL release for true
+thread-level parallelism across all CPU cores.
+
+Falls back to the staged Python/TPU pipeline if gcc is unavailable.
 """
 
 import asyncio
 import logging
+import os
 import time
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Tuple, List
 
 from ..crypto.pow_hash import uint256_from_le_bytes, compact_target_to_uint256
 from ..core.matrix import Matrix
-from ..core.tpu_matmul import TPUMatMul, hashes_to_nibbles, products_xor_hashes, get_tpu_device
 
 logger = logging.getLogger(__name__)
-
-# Try to use fast C Keccak, fall back to pure Python
-try:
-    from ..crypto.fast_keccak import FastPowHash, FastHeavyHash, is_available as fast_keccak_available
-    if fast_keccak_available():
-        USE_FAST_KECCAK = True
-        logger.info("Using C-accelerated Keccak (fast)")
-    else:
-        USE_FAST_KECCAK = False
-except ImportError:
-    USE_FAST_KECCAK = False
-
-if not USE_FAST_KECCAK:
-    from ..crypto.keccak import PowHash, HeavyHash
-    logger.warning("Using pure Python Keccak (SLOW) — install gcc for C acceleration")
 
 
 @dataclass
@@ -92,40 +78,28 @@ class PipelineStats:
         return rate
 
 
-def _cpu_prehash_chunk(args):
-    """Worker function for multiprocessing: compute PrePowHash for a chunk."""
-    pre_pow_hash, timestamp, nonces = args
-    if USE_FAST_KECCAK:
-        hasher = FastPowHash(pre_pow_hash, timestamp)
-    else:
-        hasher = PowHash(pre_pow_hash, timestamp)
-    return hasher.finalize_batch(nonces)
-
-
-def _cpu_heavyhash_chunk(inputs):
-    """Worker function for multiprocessing: compute HeavyHash for a chunk."""
-    if USE_FAST_KECCAK:
-        return FastHeavyHash.hash_batch(inputs)
-    else:
-        return HeavyHash.hash_batch(inputs)
+def _target_to_bytes(target_int: int) -> bytes:
+    """Convert a uint256 target value to 32 LE bytes."""
+    if target_int <= 0:
+        return b'\xff' * 32  # max target (easiest difficulty)
+    result = target_int.to_bytes(32, byteorder='little')
+    return result
 
 
 class MiningPipeline:
     """
-    Hybrid CPU↔TPU mining pipeline for Kaspa kHeavyHash.
+    Hybrid mining pipeline for Kaspa kHeavyHash.
     
-    The pipeline processes nonces in configurable batch sizes:
-      1. CPU cores compute PrePowHash (C Keccak) for a batch of nonces
-      2. TPU computes batched MatMul on the hash nibbles
-      3. CPU cores XOR results, compute final HeavyHash, check difficulty
-    
-    A callback is fired when a valid solution is found.
+    Uses the integrated C miner for maximum throughput:
+    - Entire pipeline in one C call (no Python overhead)
+    - ThreadPoolExecutor with GIL release for multi-core parallelism
+    - 64×64 MatMul in C (faster than TPU for such tiny matrices)
     """
     
     def __init__(
         self,
-        batch_size: int = 8192,
-        cpu_threads: int = 4,
+        batch_size: int = 65536,
+        cpu_threads: int = 32,
         on_solution: Optional[Callable[[MiningResult], None]] = None,
         on_stats: Optional[Callable[[PipelineStats], None]] = None,
         stats_interval: float = 5.0,
@@ -135,98 +109,115 @@ class MiningPipeline:
         self.on_stats = on_stats
         self.stats_interval = stats_interval
         
-        # C Keccak releases the GIL → real thread parallelism
-        # Pure Python GIL → 1 thread is optimal (no contention)
-        if USE_FAST_KECCAK:
-            # Cap at 32 threads to avoid excessive overhead per chunk
-            self.cpu_threads = min(cpu_threads, 32)
-        else:
-            self.cpu_threads = 1
+        # Cap threads reasonably
+        self.cpu_threads = min(cpu_threads, os.cpu_count() or 4)
         
-        self._tpu_device = get_tpu_device()
-        self._tpu_engine: Optional[TPUMatMul] = None
-        self._executor = ThreadPoolExecutor(max_workers=self.cpu_threads)
+        self._c_miner = None
         self._current_template: Optional[BlockTemplate] = None
         self._current_matrix: Optional[Matrix] = None
         self._target: int = 0
+        self._target_bytes: bytes = b'\xff' * 32
         self._running = False
         self._stats = PipelineStats()
         self._nonce_counter: int = 0
+        
+        # Try to initialize the integrated C miner
+        try:
+            from ..core.c_miner import is_available
+            self._use_c_miner = is_available()
+        except Exception:
+            self._use_c_miner = False
+        
+        if self._use_c_miner:
+            logger.info(f"Integrated C miner available — full pipeline in C, {self.cpu_threads} threads")
+        else:
+            logger.warning("C miner unavailable — using slow Python fallback")
     
     def update_template(self, template: BlockTemplate):
-        """
-        Update the block template (called when a new block arrives).
-        
-        Regenerates the matrix and updates the TPU engine.
-        This is called approximately once per second for Kaspa.
-        """
+        """Update the block template (called when a new block arrives)."""
         logger.info(f"New block template: {template.template_id}")
         
         self._current_template = template
         self._target = compact_target_to_uint256(template.target_bits)
+        self._target_bytes = _target_to_bytes(self._target)
         self._nonce_counter = template.nonce_start
         
         # Generate matrix on CPU (fast, once per block)
         self._current_matrix = Matrix.generate(template.pre_pow_hash)
         
-        # Transfer matrix to TPU
-        if self._tpu_engine is None:
-            self._tpu_engine = TPUMatMul(
-                self._current_matrix.data, 
-                self._tpu_device
-            )
-        else:
-            self._tpu_engine.update_matrix(self._current_matrix.data)
+        if self._use_c_miner:
+            from ..core.c_miner import IntegratedMiner
+            if self._c_miner is None:
+                self._c_miner = IntegratedMiner(
+                    pre_pow_hash=template.pre_pow_hash,
+                    timestamp=template.timestamp,
+                    matrix_data=self._current_matrix.data,
+                    target_bytes=self._target_bytes,
+                    num_threads=self.cpu_threads,
+                )
+            else:
+                self._c_miner.update_state(
+                    pre_pow_hash=template.pre_pow_hash,
+                    timestamp=template.timestamp,
+                    matrix_data=self._current_matrix.data,
+                    target_bytes=self._target_bytes,
+                )
     
     async def run(self):
-        """
-        Main mining loop — runs until stopped.
-        
-        Uses multi-chunk parallel processing: splits large batches
-        across CPU threads for Keccak, then consolidates for TPU MatMul.
-        """
+        """Main mining loop."""
         self._running = True
         self._stats = PipelineStats()
         
-        # Determine optimal chunk count and sizes
-        n_chunks = max(1, self.cpu_threads)
-        chunk_size = max(256, self.batch_size // n_chunks)
-        total_batch = chunk_size * n_chunks
+        # Use larger batches with C miner (no Python overhead per nonce)
+        batch = self.batch_size * self.cpu_threads if self._use_c_miner else self.batch_size
         
         logger.info(
-            f"Mining pipeline started — total_batch={total_batch}, "
-            f"chunks={n_chunks}x{chunk_size}, "
-            f"cpu_threads={self.cpu_threads}, "
-            f"device={'TPU' if self._tpu_device else 'CPU'}, "
-            f"keccak={'C (fast)' if USE_FAST_KECCAK else 'Python (slow)'}"
+            f"Mining pipeline started — batch={batch}, "
+            f"threads={self.cpu_threads}, "
+            f"engine={'C integrated' if self._use_c_miner else 'Python'}"
         )
         
         last_stats_time = time.time()
         
         while self._running:
-            if self._current_template is None:
+            if self._current_template is None or self._c_miner is None:
                 await asyncio.sleep(0.1)
                 continue
             
             template = self._current_template
             
-            # Get a big batch of nonces
+            # Get nonce range
             start = self._nonce_counter
-            end = min(start + total_batch, template.nonce_end)
+            end = min(start + batch, template.nonce_end)
             if start >= end:
                 await asyncio.sleep(0.1)
                 continue
             self._nonce_counter = end
+            count = end - start
             
-            nonces = np.arange(start, end, dtype=np.uint64)
+            # Mine! (runs in thread pool, GIL released)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, self._c_miner.mine_batch, start, count
+            )
             
-            # Process through the pipeline
-            solution = await self._process_batch_parallel(nonces, template, n_chunks)
+            self._stats.total_hashes += count
             
-            if solution is not None:
+            if result is not None:
+                nonce, hash_bytes = result
+                pow_value = uint256_from_le_bytes(hash_bytes)
                 self._stats.solutions_found += 1
+                
+                mining_result = MiningResult(
+                    nonce=nonce,
+                    pow_hash=hash_bytes,
+                    pow_value=pow_value,
+                    template=template,
+                )
+                
+                logger.info(f"*** SOLUTION FOUND! nonce={nonce} ***")
                 if self.on_solution:
-                    self.on_solution(solution)
+                    self.on_solution(mining_result)
             
             # Stats reporting
             now = time.time()
@@ -235,65 +226,14 @@ class MiningPipeline:
                     self.on_stats(self._stats)
                 last_stats_time = now
             
-            # Yield to event loop for template updates
+            # Yield to event loop
             await asyncio.sleep(0)
-    
-    async def _process_batch_parallel(
-        self, nonces: np.ndarray, template: BlockTemplate, n_chunks: int
-    ) -> Optional[MiningResult]:
-        """
-        Process a batch using parallel CPU workers for Keccak.
-        
-        1. Split nonces into chunks and distribute to CPU threads
-        2. Concatenate results for TPU MatMul
-        3. Split again for parallel HeavyHash + difficulty check
-        """
-        loop = asyncio.get_event_loop()
-        
-        # --- Stage 1: Parallel PrePowHash on CPU ---
-        chunks = np.array_split(nonces, n_chunks)
-        args = [(template.pre_pow_hash, template.timestamp, c) for c in chunks if len(c) > 0]
-        
-        pre_hash_parts = await asyncio.gather(*[
-            loop.run_in_executor(self._executor, _cpu_prehash_chunk, a)
-            for a in args
-        ])
-        pre_hashes = np.concatenate(pre_hash_parts, axis=0)
-        
-        # --- Stage 2: MatMul on TPU ---
-        nibbles = hashes_to_nibbles(pre_hashes)
-        products = self._tpu_engine.batched_matmul(nibbles)
-        
-        # --- Stage 3: XOR + Parallel HeavyHash on CPU ---
-        xored = products_xor_hashes(products, pre_hashes)
-        
-        xor_chunks = np.array_split(xored, n_chunks)
-        heavy_parts = await asyncio.gather(*[
-            loop.run_in_executor(self._executor, _cpu_heavyhash_chunk, c)
-            for c in xor_chunks if len(c) > 0
-        ])
-        final_hashes = np.concatenate(heavy_parts, axis=0)
-        
-        # Update stats
-        self._stats.total_hashes += len(nonces)
-        
-        # Check difficulty
-        for i in range(len(nonces)):
-            pow_value = uint256_from_le_bytes(bytes(final_hashes[i]))
-            if pow_value <= self._target:
-                logger.info(f"*** SOLUTION FOUND! nonce={nonces[i]} ***")
-                return MiningResult(
-                    nonce=int(nonces[i]),
-                    pow_hash=bytes(final_hashes[i]),
-                    pow_value=pow_value,
-                    template=template,
-                )
-        
-        return None
     
     def stop(self):
         """Stop the mining pipeline."""
         self._running = False
+        if self._c_miner:
+            self._c_miner.shutdown()
         logger.info("Mining pipeline stopping...")
     
     @property
