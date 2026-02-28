@@ -32,6 +32,7 @@ class BlockTemplate:
     pre_pow_hash: bytes          # 32 bytes
     timestamp: int               # u64
     target_bits: int             # compact target
+    pool_difficulty: float = 0.0 # pool difficulty from mining.set_difficulty
     nonce_start: int = 0         # nonce range start
     nonce_end: int = (1 << 64)   # nonce range end
     extra_data: bytes = b""      # extra data for block
@@ -86,6 +87,22 @@ def _target_to_bytes(target_int: int) -> bytes:
     return result
 
 
+def _difficulty_to_target(difficulty: float) -> int:
+    """
+    Convert pool difficulty to a uint256 target value.
+    
+    For Kaspa stratum, difficulty 1 = max target.
+    target = max_target / difficulty
+    
+    max_target for Kaspa = 2^255 - 1 (a common convention)
+    """
+    if difficulty <= 0:
+        return (1 << 256) - 1  # max
+    max_target = (1 << 256) - 1
+    target = int(max_target / difficulty)
+    return target
+
+
 class MiningPipeline:
     """
     Hybrid mining pipeline for Kaspa kHeavyHash.
@@ -138,7 +155,18 @@ class MiningPipeline:
         logger.info(f"New block template: {template.template_id}")
         
         self._current_template = template
-        self._target = compact_target_to_uint256(template.target_bits)
+        
+        # Determine target: prefer pool difficulty, fall back to target_bits
+        if template.pool_difficulty > 0:
+            self._target = _difficulty_to_target(template.pool_difficulty)
+            logger.debug(f"Using pool difficulty {template.pool_difficulty} → target {self._target:#x}")
+        elif template.target_bits > 0:
+            self._target = compact_target_to_uint256(template.target_bits)
+        else:
+            # Fallback: very hard target (this should rarely happen)
+            self._target = (1 << 224) - 1
+            logger.warning("No difficulty or target_bits set — using default target")
+        
         self._target_bytes = _target_to_bytes(self._target)
         self._nonce_counter = template.nonce_start
         

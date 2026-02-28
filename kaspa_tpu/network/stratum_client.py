@@ -409,6 +409,7 @@ class StratumClient:
                 pre_pow_hash=pre_pow_hash,
                 timestamp=timestamp,
                 target_bits=target_bits,
+                pool_difficulty=self._difficulty,
                 template_id=job_id,
             )
             self.on_new_job(template)
