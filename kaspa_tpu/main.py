@@ -222,10 +222,21 @@ async def run_benchmark(batch_size: int, cpu_threads: int, duration: float = 30.
 async def run_mining(args: argparse.Namespace):
     """Run the mining coordinator with the given arguments."""
     if args.pool:
-        # Parse pool URL: stratum+tcp://host:port
+        # Parse pool URL: stratum+tcp://host:port or stratum+ssl://host:port
         url = args.pool
-        if "://" in url:
+        use_ssl = False
+        
+        if url.startswith("stratum+ssl://"):
+            use_ssl = True
+            url = url[len("stratum+ssl://"):]
+        elif url.startswith("stratum+tcp://"):
+            url = url[len("stratum+tcp://"):]
+        elif url.startswith("ssl://"):
+            use_ssl = True
+            url = url[len("ssl://"):]
+        elif "://" in url:
             url = url.split("://", 1)[1]
+        
         parts = url.split(":")
         host = parts[0]
         port = int(parts[1]) if len(parts) > 1 else 5555
@@ -239,6 +250,7 @@ async def run_mining(args: argparse.Namespace):
             batch_size=args.batch_size,
             cpu_threads=args.cpu_threads,
             stats_interval=args.stats_interval,
+            use_ssl=use_ssl,
         )
     else:
         coordinator = MiningCoordinator(

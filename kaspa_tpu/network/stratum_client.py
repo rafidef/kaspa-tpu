@@ -19,6 +19,7 @@ Protocol flow:
 import asyncio
 import json
 import logging
+import ssl
 import time
 from dataclasses import dataclass
 from typing import Optional, Callable, Dict
@@ -60,12 +61,14 @@ class StratumClient:
         wallet_address: str,
         worker_name: str = "kaspa-tpu",
         on_new_job: Optional[Callable[[BlockTemplate], None]] = None,
+        use_ssl: bool = False,
     ):
         self.host = host
         self.port = port
         self.wallet_address = wallet_address
         self.worker_name = worker_name
         self.on_new_job = on_new_job
+        self.use_ssl = use_ssl
         
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
@@ -84,11 +87,20 @@ class StratumClient:
     
     async def connect(self):
         """Connect to the stratum server and start the mining session."""
-        logger.info(f"Connecting to stratum://{self.host}:{self.port}")
+        proto = "stratum+ssl" if self.use_ssl else "stratum+tcp"
+        logger.info(f"Connecting to {proto}://{self.host}:{self.port}")
         
-        self._reader, self._writer = await asyncio.open_connection(
-            self.host, self.port
-        )
+        if self.use_ssl:
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            self._reader, self._writer = await asyncio.open_connection(
+                self.host, self.port, ssl=ssl_ctx
+            )
+        else:
+            self._reader, self._writer = await asyncio.open_connection(
+                self.host, self.port
+            )
         self._connected = True
         logger.info("Connected to stratum server")
         

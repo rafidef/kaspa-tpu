@@ -54,6 +54,7 @@ class MiningCoordinator:
         batch_size: int = 8192,
         cpu_threads: int = 4,
         stats_interval: float = 10.0,
+        use_ssl: bool = False,
     ):
         """
         Args:
@@ -91,6 +92,7 @@ class MiningCoordinator:
                 wallet_address=wallet_address,
                 worker_name=worker_name,
                 on_new_job=self._on_new_template,
+                use_ssl=use_ssl,
             )
         else:
             self._grpc = KaspaGrpcClient(
