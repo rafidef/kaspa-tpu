@@ -77,12 +77,12 @@ Examples:
         help="Worker name (default: kaspa-tpu)",
     )
     parser.add_argument(
-        "--batch-size", "-b", type=int, default=8192,
-        help="Nonces per batch (default: 8192)",
+        "--batch-size", "-b", type=int, default=65536,
+        help="Nonces per batch (default: 65536)",
     )
     parser.add_argument(
-        "--cpu-threads", "-t", type=int, default=4,
-        help="CPU threads for Keccak (default: 4)",
+        "--cpu-threads", "-t", type=int, default=0,
+        help="CPU threads for Keccak (default: auto-detect)",
     )
     parser.add_argument(
         "--stats-interval", type=float, default=10.0,
@@ -283,6 +283,10 @@ async def run_mining(args: argparse.Namespace):
 def main():
     args = parse_args()
     setup_logging(args.verbose)
+    
+    # Auto-detect CPU threads if not specified
+    if args.cpu_threads <= 0:
+        args.cpu_threads = max(1, os.cpu_count() or 4)
     
     if args.benchmark:
         asyncio.run(run_benchmark(args.batch_size, args.cpu_threads))
