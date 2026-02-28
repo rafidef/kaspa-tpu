@@ -20,13 +20,95 @@ import asyncio
 import json
 import logging
 import ssl
+import struct
 import time
 from dataclasses import dataclass
-from typing import Optional, Callable, Dict
+from typing import Optional, Callable, Dict, Union, List
 
 from ..mining.pipeline import BlockTemplate
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_hash_field(value) -> Optional[bytes]:
+    """
+    Parse a hash field that may come in different formats:
+    
+    1. List of uint64 integers (EthereumStratum / Kryptex):
+       [6197039728657996264, 411471374475628887, ...] → 4 × u64 LE = 32 bytes
+    
+    2. Hex string: "abcdef0123456789..." → bytes.fromhex()
+    
+    3. List of uint8 integers: [0x56, 0x08, ...] → bytes directly
+    
+    Returns 32-byte hash or None on failure.
+    """
+    if isinstance(value, list):
+        if not value:
+            return None
+        
+        if all(isinstance(v, int) for v in value):
+            if len(value) == 4:
+                # 4 × uint64, little-endian → 32 bytes
+                try:
+                    return struct.pack('<4Q', *value)
+                except struct.error:
+                    pass
+            elif len(value) == 32:
+                # 32 × uint8 → 32 bytes
+                try:
+                    return bytes(value)
+                except (ValueError, TypeError):
+                    pass
+            elif len(value) == 8:
+                # 8 × uint32, little-endian → 32 bytes
+                try:
+                    return struct.pack('<8I', *value)
+                except struct.error:
+                    pass
+        
+        # Try converting all elements to a flat byte array
+        try:
+            flat = []
+            for v in value:
+                if isinstance(v, int):
+                    if v > 0xFFFFFFFFFFFFFFFF:
+                        return None
+                    elif v > 0xFFFFFFFF:
+                        flat.extend(struct.pack('<Q', v))
+                    elif v > 0xFF:
+                        flat.extend(struct.pack('<I', v))
+                    else:
+                        flat.append(v)
+            result = bytes(flat)
+            if len(result) >= 32:
+                return result[:32]
+        except (ValueError, TypeError, struct.error):
+            pass
+        
+        return None
+    
+    elif isinstance(value, str):
+        # Hex string
+        hex_str = value
+        if hex_str.startswith("0x") or hex_str.startswith("0X"):
+            hex_str = hex_str[2:]
+        try:
+            data = bytes.fromhex(hex_str)
+            if len(data) >= 32:
+                return data[:32]
+            elif len(data) > 0:
+                return data.ljust(32, b'\x00')
+        except ValueError:
+            pass
+        return None
+    
+    elif isinstance(value, bytes):
+        if len(value) >= 32:
+            return value[:32]
+        return value.ljust(32, b'\x00')
+    
+    return None
 
 
 @dataclass
@@ -249,38 +331,43 @@ class StratumClient:
         """
         Handle mining.notify — new job from the pool.
         
-        Kaspa stratum notify params can vary by pool implementation.
-        Common formats:
-          [job_id, pre_pow_hash_hex, timestamp_hex/int, nonce_hex/int, clean_jobs]
-          [job_id, header_data, ...]
+        Supports multiple stratum formats:
         
-        We try to parse flexibly.
+        1. Kryptex/EthereumStratum:
+           params = [job_id, [u64, u64, u64, u64], timestamp, nonce, clean]
+           where the hash is 4 × uint64 little-endian
+        
+        2. Standard Kaspa stratum:
+           params = [job_id, "hex_hash", timestamp, bits, clean]
+        
+        3. Dict format:
+           params = {"jobId": ..., "prePowHash": ..., ...}
         """
         if not params:
             logger.warning(f"mining.notify with empty params")
             return
         
+        pre_pow_hash = None
+        job_id = "0"
+        timestamp = 0
+        target_bits = 0
+        clean_jobs = True
+        
         if isinstance(params, dict):
-            # Some pools send params as a dict
             job_id = str(params.get("id", params.get("jobId", "0")))
-            pre_pow_hash_hex = str(params.get("prePowHash", params.get("header", "")))
+            raw_hash = params.get("prePowHash", params.get("header", ""))
+            pre_pow_hash = _parse_hash_field(raw_hash)
             timestamp = params.get("timestamp", 0)
             target_bits = params.get("bits", params.get("nBits", 0))
             clean_jobs = params.get("cleanJobs", True)
+            
         elif isinstance(params, list):
             if len(params) < 2:
                 logger.warning(f"mining.notify with insufficient params: {params}")
                 return
             
             job_id = str(params[0])
-            
-            # params[1] could be pre_pow_hash or full header data
-            pre_pow_hash_hex = str(params[1])
-            
-            # Parse remaining fields with flexibility
-            timestamp = 0
-            target_bits = 0
-            clean_jobs = True
+            pre_pow_hash = _parse_hash_field(params[1])
             
             if len(params) > 2:
                 try:
@@ -302,22 +389,9 @@ class StratumClient:
             logger.warning(f"mining.notify unexpected params type: {type(params)}")
             return
         
-        # Validate and convert pre_pow_hash
-        # Strip 0x prefix if present
-        if pre_pow_hash_hex.startswith("0x"):
-            pre_pow_hash_hex = pre_pow_hash_hex[2:]
-        
-        try:
-            pre_pow_hash = bytes.fromhex(pre_pow_hash_hex)
-        except ValueError:
-            logger.warning(f"Invalid pre_pow_hash hex: {pre_pow_hash_hex[:64]}...")
+        if pre_pow_hash is None:
+            logger.warning(f"Could not parse pre_pow_hash from job {job_id}: {str(params[1] if isinstance(params, list) else params)[:80]}")
             return
-        
-        # Pad or truncate to 32 bytes
-        if len(pre_pow_hash) < 32:
-            pre_pow_hash = pre_pow_hash.ljust(32, b'\x00')
-        elif len(pre_pow_hash) > 32:
-            pre_pow_hash = pre_pow_hash[:32]
         
         self._current_job = StratumJob(
             job_id=job_id,
@@ -327,7 +401,7 @@ class StratumClient:
             clean_jobs=clean_jobs,
         )
         
-        logger.info(f"New job: {job_id}, clean={clean_jobs}, hash={pre_pow_hash_hex[:16]}...")
+        logger.info(f"New job: {job_id}, clean={clean_jobs}, hash={pre_pow_hash.hex()[:16]}...")
         
         # Convert to BlockTemplate and notify pipeline
         if self.on_new_job:
